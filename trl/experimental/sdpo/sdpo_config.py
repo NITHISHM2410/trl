@@ -87,39 +87,24 @@ class SDPOConfig(GRPOConfig):
         default=False,
         metadata={"help": "Whether to add tail log-prob to top-k distillation."},
     )
-    dont_reprompt_on_self_success: bool = field(
-        default=True,
-        metadata={"help": "Skip reprompting when model generates correct response."},
-    )
     ema_update_rate: float = field(
         default=0.05,
         metadata={"help": "EMA update rate for teacher model."},
     )
     max_reprompt_len: int = field(
-        default=10240,
+        default=512,
         metadata={"help": "Maximum length for reprompting in self-distillation."},
     )
     distillation_weight: float = field(
         default=1.0,
         metadata={"help": "Weight for self-distillation loss term."},
     )
-    use_successful_as_teacher: bool = field(
-        default=True,
-        metadata={"help": "Use successful rollouts as implicit feedback for self-distillation."},
-    )
-    success_reward_threshold: float = field(
-        default=1.0,
-        metadata={"help": "Minimum reward for a rollout to be considered a successful demonstration."},
-    )
     reprompt_template: str = field(
-        default="{prompt}{solution}\n\nCorrectly solve the original question.\n",
+        default="{feedback}{prompt}\n\nCorrectly solve the original question.\n",
         metadata={"help": "Template for reprompting the teacher with a successful demonstration."},
-    )
-    solution_template: str = field(
-        default="\nCorrect solution:\n\n{successful_previous_attempt}\n\n",
-        metadata={"help": "Template for formatting the successful demonstration text."},
     )
     remove_thinking_from_demonstration: bool = field(
         default=False,
         metadata={"help": "Whether to remove <think>...</think> blocks from the demonstration text."},
     )
+

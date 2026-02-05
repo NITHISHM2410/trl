@@ -75,7 +75,7 @@ class SDPOTrainer(GRPOTrainer):
     ```
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, feedback_fn, *args, **kwargs):
         # Ensure we're using SDPOConfig
         if not isinstance(kwargs.get("args", None), SDPOConfig):
             # If args is not provided or not SDPOConfig, use default SDPOConfig
@@ -85,6 +85,9 @@ class SDPOTrainer(GRPOTrainer):
                 kwargs["args"] = SDPOConfig()
 
         super().__init__(*args, **kwargs)
+
+        # Custom feedback fn
+        self.feedback_fn = feedback_fn
 
         # Stash for per-func rewards from _calculate_rewards
         self._last_rewards_per_func = None
@@ -108,12 +111,13 @@ class SDPOTrainer(GRPOTrainer):
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Build teacher inputs and add to output
-        self._build_teacher_inputs(output, prompts, rewards)
+        self._build_teacher_inputs(inputs, output, prompts, rewards)
 
         return output
 
     def _build_teacher_inputs(
         self,
+        inputs: dict,
         output: dict[str, torch.Tensor | Any],
         prompts: list,
         rewards: torch.Tensor,
@@ -134,9 +138,6 @@ class SDPOTrainer(GRPOTrainer):
         # Gather completion_ids across processes.
         all_completion_ids = self.accelerator.gather(completion_ids)  # (total_samples, T_comp)
 
-        threshold = self.args.success_reward_threshold
-        dont_reprompt_self = self.args.dont_reprompt_on_self_success
-
         # Gather all prompts across processes to map global indices to prompt text
         from accelerate.utils import gather_object
 
@@ -146,59 +147,30 @@ class SDPOTrainer(GRPOTrainer):
         teacher_messages_list = []
         self_distillation_mask = torch.ones(total_samples, device=device)
 
+        assert len(all_completion_ids) == total_samples == len(all_prompts)
         for i in range(total_samples):
             group_idx = i // num_generations
-            group_start = group_idx * num_generations
-            group_end = group_start + num_generations
 
-            if self_distillation_mask[i].item() == 0.0:
-                # No successful demo found; use original prompt (loss will be masked)
-                original_prompt = all_prompts[group_idx]
-                teacher_messages_list.append(original_prompt)
-                continue
-
-            # Find successful demo
-            successful = []
-            for j in range(group_start, group_end):
-                if dont_reprompt_self and j == i:
-                    continue
-                if rewards[j].item() >= threshold:
-                    successful.append(j)
-
-            demo_idx = successful[0]
-            demo_ids = all_completion_ids[demo_idx]
+            demo_ids = all_completion_ids[i]
             demo_ids = demo_ids[demo_ids != self.processing_class.pad_token_id]
             demo_text = self.processing_class.decode(demo_ids, skip_special_tokens=True)
 
             if self.args.remove_thinking_from_demonstration:
                 demo_text = re.sub(r"<think>.*?</think>", "", demo_text, flags=re.DOTALL).strip()
 
+            feedback_args = {k: inputs[i][k] for k in inputs[i] if k not in ["prompt", "completion", "completion_ids"]}
             original_prompt = all_prompts[group_idx]
+            feedback = self.feedback_fn(demo_text, **feedback_args)
 
-            # Format the solution text
-            solution_text = self.args.solution_template.format(successful_previous_attempt=demo_text)
+            # with open("feedback.txt", "a") as feedback_file:
+            #     feedback_file.write(str(feedback) + '\n' + str(original_prompt) + '\n' + str(feedback_args))
 
-            # Build the reprompted message
-            # original_prompt is a list of message dicts (conversational format)
-            # Extract the text content from the last user message
             if isinstance(original_prompt, list):
-                # Conversational format - extract text from last user message
-                prompt_text = ""
-                for msg in original_prompt:
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, list):
-                            prompt_text = " ".join(
-                                part.get("text", "") for part in content if part.get("type") == "text"
-                            )
-                        else:
-                            prompt_text = content
-
-                reprompted_text = self.args.reprompt_template.format(prompt=prompt_text, solution=solution_text)
-                # Build new conversational message
-                teacher_messages_list.append([{"role": "user", "content": reprompted_text}])
+                reprompted_text = [{'role': 'system', 'content': feedback}] + original_prompt
+                teacher_messages_list.append(reprompted_text)
+                assert reprompted_text[0]['role'] == 'system' and reprompted_text[1]['role'] == 'system' and reprompted_text[2]['role'] == 'user'
             else:
-                reprompted_text = self.args.reprompt_template.format(prompt=original_prompt, solution=solution_text)
+                reprompted_text = self.args.reprompt_template.format(feedback=feedback, prompt=original_prompt)
                 teacher_messages_list.append(reprompted_text)
 
         # Tokenize teacher messages
@@ -207,7 +179,7 @@ class SDPOTrainer(GRPOTrainer):
             if isinstance(msg, list) and isinstance(msg[0], dict):
                 # Conversational format
                 tokenized = self.processing_class.apply_chat_template(
-                    msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+                    msg, tokenize=True, add_generation_prompt=True, return_tensors="pt", enable_thinking=False
                 )
                 if isinstance(tokenized, dict):
                     ids = tokenized["input_ids"].squeeze(0)
